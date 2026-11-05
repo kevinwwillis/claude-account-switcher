@@ -16,7 +16,7 @@ go vet ./...
 go test ./...
 go build -ldflags "-H=windowsgui -s -w" -o claude-account-switcher.exe .   # Windows
 CGO_ENABLED=1 go build -o claude-account-switcher .                        # macOS
-go build -ldflags "-s -w" -o claude-account-switcher .                     # Linux
+go build -ldflags "-s -w" -o claude-account-switcher .                     # Linux, needs libleveldb-dev
 ```
 
 Every pull request runs vet and tests on Windows, macOS and Linux.

@@ -23,6 +23,7 @@ type tray struct {
 	accounts   [maxAccounts]*systray.MenuItem
 	auto       *systray.MenuItem
 	spend      *systray.MenuItem
+	sidebar    *systray.MenuItem
 	thresholds []*systray.MenuItem
 	custom     *systray.MenuItem
 	add        *systray.MenuItem
@@ -56,6 +57,9 @@ func (t *tray) onReady() {
 	t.spend = systray.AddMenuItemCheckbox(tr("Auto-switch to use up expiring weekly", "自动用掉即将重置的周额度"),
 		tr("Switch to an account whose weekly limit resets within a day with half or more of it unused",
 			"切换到周额度将在一天内重置、且至少一半尚未使用的账号"), false)
+	t.sidebar = systray.AddMenuItemCheckbox(tr("Same sidebar in every account", "所有账号使用相同侧边栏"),
+		tr("On every switch, give all accounts the folders, folder contents and pins of the account you leave",
+			"每次切换时，让所有账号使用所离开账号的文件夹、文件夹内容和置顶"), false)
 	t.add = systray.AddMenuItem(tr("Add account…", "添加账号…"),
 		tr("Restart Claude on its sign-in screen, your current account is kept", "重启 Claude 并打开登录页面，当前账号会保留"))
 	t.importNow = systray.AddMenuItem(tr("Import chats from all accounts", "导入所有账号的聊天"),
@@ -102,6 +106,8 @@ func (t *tray) onReady() {
 				t.s.setAuto(!t.auto.Checked())
 			case <-t.spend.ClickedCh:
 				t.s.setSpendWeekly(!t.spend.Checked())
+			case <-t.sidebar.ClickedCh:
+				t.s.setSyncSidebar(!t.sidebar.Checked())
 			case <-t.add.ClickedCh:
 				go t.s.run(tr("Add account", "添加账号"), t.s.addAccount)
 			case <-t.importNow.ClickedCh:
@@ -219,6 +225,7 @@ func (t *tray) render() {
 
 	setChecked(t.auto, snap.AutoSwitch)
 	setChecked(t.spend, snap.SpendWeekly)
+	setChecked(t.sidebar, snap.SyncSidebar)
 	for i, item := range t.thresholds {
 		setChecked(item, thresholds[i] == snap.Threshold)
 	}

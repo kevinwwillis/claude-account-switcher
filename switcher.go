@@ -41,7 +41,10 @@ type State struct {
 	AutoSwitch bool       `json:"autoSwitch"`
 	Threshold  float64    `json:"threshold"`
 	// SpendWeekly moves to an account whose week is about to reset mostly unused.
-	SpendWeekly bool      `json:"spendWeekly"`
+	SpendWeekly bool `json:"spendWeekly"`
+	// SyncSidebar makes every account's Code sidebar (folders, what is in
+	// them, pins) match the account being left, on every switch.
+	SyncSidebar bool      `json:"syncSidebar,omitempty"`
 	LastSwitch  time.Time `json:"lastSwitch"`
 	HandSwitch  time.Time `json:"handSwitch"`
 	// Why the last switch happened, and the account it left.
@@ -471,6 +474,7 @@ func (s *switcher) switchTo(uuid string, cause switchCause) error {
 		n, err := syncSessions(s.app().sessionsDir(), target.UUID, target.Org)
 		log.Printf("switched to %s, %d chats imported", target.label(), n)
 		s.importProjects(target)
+		s.syncSidebarFrom(active)
 		return err
 	})
 	if err == nil {
@@ -547,6 +551,42 @@ func (s *switcher) setAuto(on bool) {
 	s.onChange()
 }
 
+// syncSidebarFrom copies the sidebar of account from to all others, when
+// that is turned on. It backs up and puts back its own files, so a failure
+// only costs the sync and the switch goes on.
+func (s *switcher) syncSidebarFrom(from string) {
+	s.mu.Lock()
+	on := s.st.SyncSidebar
+	src := s.account(from)
+	var scopes []string
+	for _, a := range s.st.Accounts {
+		if a.Org != "" {
+			scopes = append(scopes, scopeKey(a.UUID, a.Org))
+		}
+	}
+	s.mu.Unlock()
+	if !on || src == nil || src.Org == "" {
+		return
+	}
+	res, err := syncSidebar(s.app(), scopeKey(src.UUID, src.Org), scopes, filepath.Join(s.dir, "sidebar-backups"))
+	switch {
+	case err != nil:
+		log.Printf("sidebar not synced from %s: %v", src.label(), err)
+	case res.Changed:
+		log.Printf("sidebar synced from %s: folders in %d accounts, %d pins, backup %s", src.label(), res.Scopes, res.Pins, res.Backup)
+	default:
+		log.Printf("sidebar already matches %s", src.label())
+	}
+}
+
+func (s *switcher) setSyncSidebar(on bool) {
+	s.mu.Lock()
+	s.st.SyncSidebar = on
+	s.saveState()
+	s.mu.Unlock()
+	s.onChange()
+}
+
 func (s *switcher) setSpendWeekly(on bool) {
 	s.mu.Lock()
 	s.st.SpendWeekly = on
@@ -569,6 +609,7 @@ type snapshot struct {
 	Active      string
 	AutoSwitch  bool
 	SpendWeekly bool
+	SyncSidebar bool
 	Threshold   float64
 	Status      string
 	Note        string
@@ -580,7 +621,7 @@ type snapshot struct {
 func (s *switcher) snapshot() snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snap := snapshot{Active: s.active, AutoSwitch: s.st.AutoSwitch, SpendWeekly: s.st.SpendWeekly, Threshold: s.st.Threshold,
+	snap := snapshot{Active: s.active, AutoSwitch: s.st.AutoSwitch, SpendWeekly: s.st.SpendWeekly, SyncSidebar: s.st.SyncSidebar, Threshold: s.st.Threshold,
 		Status: s.status, Note: s.autoNote(time.Now()), Busy: s.busy.Load()}
 	if !s.st.NoUpdateCheck && newerVersion(s.st.LatestVersion, version) {
 		snap.Update = s.st.LatestVersion
