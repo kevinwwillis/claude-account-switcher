@@ -125,6 +125,8 @@ func releaseAsset() string {
 		return "claude-account-switcher-windows-amd64.exe"
 	case "darwin":
 		return "claude-account-switcher-macos"
+	case "linux":
+		return "claude-account-switcher-linux-" + runtime.GOARCH
 	}
 	return ""
 }

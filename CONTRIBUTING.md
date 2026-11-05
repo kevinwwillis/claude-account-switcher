@@ -16,9 +16,10 @@ go vet ./...
 go test ./...
 go build -ldflags "-H=windowsgui -s -w" -o claude-account-switcher.exe .   # Windows
 CGO_ENABLED=1 go build -o claude-account-switcher .                        # macOS
+go build -ldflags "-s -w" -o claude-account-switcher .                     # Linux
 ```
 
-Every pull request runs vet and tests on Windows and macOS.
+Every pull request runs vet and tests on Windows, macOS and Linux.
 
 ## Where things are
 
@@ -32,7 +33,7 @@ Every pull request runs vet and tests on Windows and macOS.
 | `usage.go` | Profile and usage requests to `api.anthropic.com`, polling, backoff |
 | `update.go` | The daily check for a new release on GitHub |
 | `desktop.go` | Reading Claude's data folder: `config.json`, cookies, the active account |
-| `crypto_*.go` | Decrypting Claude's token cache (DPAPI, keychain) |
+| `crypto_*.go` | Decrypting Claude's token cache (DPAPI, keychain, Secret Service) |
 | `platform_*.go` | Finding, quitting and starting Claude, start at login, OS specifics |
 | `icon.go` | The usage ring in the tray |
 
@@ -48,6 +49,6 @@ These keep the tool safe to run on someone's real sign-ins:
 ## Pull requests
 
 - One change per pull request. Small is easier to review.
-- Say what you tested on: Windows Store app, Windows direct download, macOS.
+- Say what you tested on: Windows Store app, Windows direct download, macOS, Linux.
 - Commit messages in plain English, imperative, like the existing history ("Poll usage less often and back off after 429").
 - By contributing you agree that your work is licensed under [Apache 2.0](LICENSE), like the rest of the project.

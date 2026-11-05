@@ -20,6 +20,9 @@ jobs:
           - os: macos-latest
             out: claude-account-switcher-macos
             flags: -s -w
+          - os: ubuntu-latest
+            out: claude-account-switcher-linux-amd64
+            flags: -s -w
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
