@@ -66,10 +66,10 @@ type sidebarResult struct {
 
 // syncSidebar makes every account in scopes show the folders, folder
 // contents and pins of source. The app must be closed. Before it writes,
-// it copies everything it changes into a new folder under backupRoot. If a
-// step fails, what it had written is put back.
-func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (sidebarResult, error) {
-	var res sidebarResult
+// it copies everything it changes into a new folder under backupRoot (the
+// first backup ever made is kept for good in backupRoot/first). If a step
+// fails, what it had written is put back.
+func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (res sidebarResult, err error) {
 	if appRunning() {
 		return res, errors.New("Claude is running")
 	}
@@ -86,6 +86,9 @@ func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (
 	// Build the new database in a copy next to the live one.
 	live := d.localStorageDir()
 	if _, err := os.Stat(filepath.Join(live, "CURRENT")); err != nil {
+		if _, oerr := os.Stat(live + ".switcher-old"); oerr == nil {
+			return res, fmt.Errorf("Local Storage is missing but %s.switcher-old exists: an earlier sync was interrupted, put that folder back by hand", live)
+		}
 		return res, fmt.Errorf("no Local Storage database: %w", err)
 	}
 	work := live + ".switcher-work"
@@ -97,7 +100,11 @@ func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (
 		return res, fmt.Errorf("copy Local Storage: %w", err)
 	}
 	defer os.RemoveAll(work)
-	groupsByScope, sectionsByScope, changed, err := rewriteLocalStorage(work, source, others)
+	changed, err := rewriteLocalStorage(work, source, others)
+	if err != nil {
+		return res, err
+	}
+	mirror, mirrorChanged, err := planPrefsMirror(d.prefsPath(), source, others)
 	if err != nil {
 		return res, err
 	}
@@ -108,23 +115,21 @@ func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (
 	if err != nil {
 		return res, err
 	}
-	if !changed && len(pinEdits) == 0 {
+	if !changed && !mirrorChanged && len(pinEdits) == 0 {
 		return res, nil
 	}
 
 	// Back up everything that is about to change.
-	bk := filepath.Join(backupRoot, time.Now().Format("20060102-150405.000"))
-	if err := os.MkdirAll(bk, 0o700); err != nil {
+	bk, err := newSidebarBackup(backupRoot)
+	if err != nil {
 		return res, err
 	}
 	res.Backup = bk
-	if changed {
-		if err := copyDir(live, filepath.Join(bk, "leveldb")); err != nil {
-			return res, fmt.Errorf("back up Local Storage: %w", err)
-		}
-		if err := copyFile(d.prefsPath(), filepath.Join(bk, filepath.Base(d.prefsPath()))); err != nil {
-			return res, fmt.Errorf("back up %s: %w", filepath.Base(d.prefsPath()), err)
-		}
+	if err := copyDir(live, filepath.Join(bk, "leveldb")); err != nil {
+		return res, fmt.Errorf("back up Local Storage: %w", err)
+	}
+	if err := copyFile(d.prefsPath(), filepath.Join(bk, filepath.Base(d.prefsPath()))); err != nil {
+		return res, fmt.Errorf("back up %s: %w", filepath.Base(d.prefsPath()), err)
 	}
 	for _, e := range pinEdits {
 		rel, _ := filepath.Rel(root, e.path)
@@ -132,22 +137,37 @@ func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (
 			return res, fmt.Errorf("back up %s: %w", rel, err)
 		}
 	}
+	keepFirstBackup(backupRoot, bk)
 	pruneBackups(backupRoot)
 
-	// Write: the database first, then the mirror, then the pins.
+	// Write: the database, the mirror, the pins. Any failure puts all of it back.
+	var pinsDone []pinEdit
+	defer func() {
+		if err != nil {
+			if rerr := restoreSidebar(d, bk, pinsDone); rerr != nil {
+				err = fmt.Errorf("%w; putting the backup %s back also failed: %v", err, bk, rerr)
+			} else {
+				err = fmt.Errorf("%w (the backup was put back)", err)
+			}
+			res = sidebarResult{Backup: bk}
+		}
+	}()
 	if changed {
-		if err := swapDir(work, live); err != nil {
+		if err = swapDir(work, live); err != nil {
 			return res, fmt.Errorf("replace Local Storage: %w", err)
 		}
-		if err := writePrefsMirror(d.prefsPath(), groupsByScope, sectionsByScope); err != nil {
-			restoreSidebar(d, bk, nil)
+	}
+	if mirrorChanged {
+		if err = mirror.write(d.prefsPath()); err != nil {
 			return res, fmt.Errorf("update %s: %w", filepath.Base(d.prefsPath()), err)
 		}
+	}
+	if changed || mirrorChanged {
 		res.Scopes = len(others)
 	}
-	for i, e := range pinEdits {
-		if err := setStarred(e.path, e.starred); err != nil {
-			restoreSidebar(d, bk, pinEdits[:i+1])
+	for _, e := range pinEdits {
+		pinsDone = append(pinsDone, e)
+		if err = setStarred(e.path, e.starred); err != nil {
 			return res, fmt.Errorf("set pin: %w", err)
 		}
 	}
@@ -156,31 +176,65 @@ func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (
 	return res, nil
 }
 
-// restoreSidebar puts a sidebar backup back: the database and mirror when
-// the backup has them, and the given entry files.
-func restoreSidebar(d desktop, bk string, pins []pinEdit) {
+// newSidebarBackup makes a new, empty backup folder.
+func newSidebarBackup(root string) (string, error) {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", err
+	}
+	return os.MkdirTemp(root, time.Now().Format("20060102-150405-"))
+}
+
+// keepFirstBackup copies the first backup ever made to root/first, which
+// pruning never removes: the sidebar as it was before the switcher touched it.
+func keepFirstBackup(root, bk string) {
+	first := filepath.Join(root, "first")
+	if _, err := os.Stat(first); err == nil {
+		return
+	}
+	_ = filepath.WalkDir(bk, func(p string, e os.DirEntry, err error) error {
+		if err != nil || e.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(bk, p)
+		return copyFile(p, filepath.Join(first, rel))
+	})
+}
+
+// restoreSidebar puts a sidebar backup back: the database, the mirror and
+// the given entry files.
+func restoreSidebar(d desktop, bk string, pins []pinEdit) error {
+	var errs []error
 	if _, err := os.Stat(filepath.Join(bk, "leveldb", "CURRENT")); err == nil {
 		tmp := d.localStorageDir() + ".switcher-restore"
 		_ = os.RemoveAll(tmp)
-		if copyDir(filepath.Join(bk, "leveldb"), tmp) == nil {
-			_ = swapDir(tmp, d.localStorageDir())
+		if err := copyDir(filepath.Join(bk, "leveldb"), tmp); err != nil {
+			errs = append(errs, err)
+		} else if err := swapDir(tmp, d.localStorageDir()); err != nil {
+			errs = append(errs, err)
 		}
 		_ = os.RemoveAll(tmp)
-		_ = copyFile(filepath.Join(bk, filepath.Base(d.prefsPath())), d.prefsPath())
+	}
+	if _, err := os.Stat(filepath.Join(bk, filepath.Base(d.prefsPath()))); err == nil {
+		if err := copyFile(filepath.Join(bk, filepath.Base(d.prefsPath())), d.prefsPath()); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	for _, e := range pins {
 		rel, _ := filepath.Rel(d.sessionsDir(), e.path)
-		_ = copyFile(filepath.Join(bk, "claude-code-sessions", rel), e.path)
+		if err := copyFile(filepath.Join(bk, "claude-code-sessions", rel), e.path); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
 }
 
 // rewriteLocalStorage changes the database at dir so the folders of every
-// scope in others match source. It returns the new per-scope maps and
-// whether anything changed.
-func rewriteLocalStorage(dir, source string, others []string) (groups, sections map[string]any, changed bool, err error) {
+// scope in others match source, and says whether anything changed. Each of
+// the three copies the app keeps is rebuilt from its own source entry.
+func rewriteLocalStorage(dir, source string, others []string) (changed bool, err error) {
 	db, err := openLocalStorage(dir, false)
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("open Local Storage: %w", err)
+		return false, fmt.Errorf("open Local Storage: %w", err)
 	}
 	defer func() {
 		if cerr := db.close(); err == nil && cerr != nil {
@@ -190,86 +244,138 @@ func rewriteLocalStorage(dir, source string, others []string) (groups, sections 
 
 	store, err := lsGet(db, lsStore)
 	if err != nil {
-		return nil, nil, false, err
+		return false, err
 	}
 	state, ok := store["state"].(map[string]any)
 	if !ok {
-		return nil, nil, false, errors.New("dframe-store has no state")
+		return false, errors.New("dframe-store has no state")
 	}
-	groups, _ = state["customGroupsByScope"].(map[string]any)
-	sections, _ = state["codeSidebarByScope"].(map[string]any)
-	if groups == nil || sections == nil {
-		return nil, nil, false, errors.New("dframe-store has no folders")
+	groups, _ := state["customGroupsByScope"].(map[string]any)
+	sections, _ := state["codeSidebarByScope"].(map[string]any)
+	ch, err := syncScopes(groups, sections, source, others, true)
+	if err != nil {
+		return false, fmt.Errorf("dframe-store: %w", err)
 	}
+	puts := map[string]any{}
+	if ch {
+		puts[lsStore] = store
+	}
+
+	// The persisted copies, when the app keeps them.
+	pg, gerr := lsGet(db, lsGroups)
+	ps, serr := lsGet(db, lsSections)
+	for _, e := range []error{gerr, serr} {
+		if e != nil && !errors.Is(e, errNotFound) {
+			return false, e
+		}
+	}
+	if pg != nil && ps != nil {
+		g, _ := pg["value"].(map[string]any)
+		s, _ := ps["value"].(map[string]any)
+		ch, err := syncScopes(g, s, source, others, false)
+		if err != nil {
+			return false, fmt.Errorf("persisted sidebar: %w", err)
+		}
+		if ch {
+			puts[lsGroups], puts[lsSections] = pg, ps
+		}
+	}
+	if len(puts) == 0 {
+		return false, nil
+	}
+	return true, lsPut(db, puts)
+}
+
+// syncScopes rewrites groups[scope] and sections[scope] of every scope in
+// others from source. With required, a missing source layout is an error;
+// without, the containers are left alone. It refuses a source without
+// folders, which would empty the other accounts, and duplicate folder
+// names, which cannot be matched.
+func syncScopes(groups, sections map[string]any, source string, others []string, required bool) (bool, error) {
 	srcGroups, _ := groups[source].(map[string]any)
 	srcSections, _ := sections[source].(map[string]any)
 	if srcGroups == nil || srcSections == nil {
-		return nil, nil, false, fmt.Errorf("no sidebar layout for the account being left (%s)", source)
+		if required {
+			return false, fmt.Errorf("no sidebar layout for the account being left (%s)", source)
+		}
+		return false, nil
 	}
-
+	if len(listOf(srcGroups, "groups")) == 0 {
+		return false, errors.New("the account being left has no folders; not copying an empty sidebar over the others")
+	}
+	changed := false
 	for _, scope := range others {
 		tgtGroups, _ := groups[scope].(map[string]any)
 		tgtSections, _ := sections[scope].(map[string]any)
 		g, s, err := rebuildScope(srcGroups, srcSections, tgtGroups, tgtSections)
 		if err != nil {
-			return nil, nil, false, fmt.Errorf("scope %s: %w", scope, err)
+			return false, fmt.Errorf("scope %s: %w", scope, err)
 		}
 		if !jsonEqual(g, groups[scope]) || !jsonEqual(s, sections[scope]) {
 			changed = true
 		}
 		groups[scope], sections[scope] = g, s
 	}
-	if !changed {
-		return groups, sections, false, nil
-	}
+	return changed, nil
+}
 
-	puts := map[string]any{lsStore: store}
-	for key, val := range map[string]map[string]any{lsGroups: groups, lsSections: sections} {
-		obj, err := lsGet(db, key)
-		if err != nil && !errors.Is(err, errNotFound) {
-			return nil, nil, false, err
+// folderIDs maps folder names to ids, and fails on a name used twice.
+func folderIDs(groups, sections map[string]any) (map[string]string, error) {
+	ids := map[string]string{}
+	for _, g := range listOf(groups, "groups") {
+		name, id := str(g, "name"), str(g, "id")
+		if id == "" {
+			return nil, errors.New("a folder has no id")
 		}
-		if obj == nil {
-			obj = map[string]any{}
+		if _, dup := ids[name]; dup {
+			return nil, fmt.Errorf("two folders are named %q", name)
 		}
-		obj["value"] = val
-		puts[key] = obj
+		ids[name] = id
 	}
-	if err := lsPut(db, puts); err != nil {
-		return nil, nil, false, err
+	for _, s := range listOf(sections, "sections") {
+		if str(s, "kind") != "manual" {
+			continue
+		}
+		if _, ok := ids[str(s, "name")]; !ok && str(s, "id") != "" {
+			ids[str(s, "name")] = str(s, "id")
+		}
 	}
-	return groups, sections, true, nil
+	return ids, nil
 }
 
 // rebuildScope is the source layout with the target's own folder ids,
 // matched by folder name. A folder the target does not have keeps the
-// source's id.
+// source's id. Entries of the target's scope objects other than the
+// layout itself (bookkeeping such as migratedFrom) are kept.
 func rebuildScope(srcGroups, srcSections, tgtGroups, tgtSections map[string]any) (map[string]any, map[string]any, error) {
-	tgtIDs := map[string]string{}
-	for _, s := range listOf(tgtSections, "sections") {
-		if str(s, "kind") == "manual" && str(s, "name") != "" && str(s, "id") != "" {
-			tgtIDs[str(s, "name")] = str(s, "id")
-		}
+	srcIDs, err := folderIDs(srcGroups, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("account being left: %w", err)
 	}
-	for _, g := range listOf(tgtGroups, "groups") {
-		if str(g, "name") != "" && str(g, "id") != "" {
-			tgtIDs[str(g, "name")] = str(g, "id")
+	tgtIDs, err := folderIDs(tgtGroups, tgtSections)
+	if err != nil {
+		return nil, nil, err
+	}
+	idmap := map[string]string{}
+	for name, id := range srcIDs {
+		idmap[id] = id
+		if t, ok := tgtIDs[name]; ok {
+			idmap[id] = t
 		}
 	}
 
-	g := deepCopy(srcGroups).(map[string]any)
-	idmap := map[string]string{}
+	g := map[string]any{}
+	for k, v := range tgtGroups {
+		g[k] = v
+	}
+	for _, k := range []string{"groups", "assignments", "order"} {
+		delete(g, k)
+		if v, ok := srcGroups[k]; ok {
+			g[k] = deepCopy(v)
+		}
+	}
 	for _, gr := range listOf(g, "groups") {
-		id, name := str(gr, "id"), str(gr, "name")
-		if id == "" {
-			return nil, nil, errors.New("a folder has no id")
-		}
-		newID := id
-		if t, ok := tgtIDs[name]; ok {
-			newID = t
-		}
-		idmap[id] = newID
-		gr["id"] = newID
+		gr["id"] = idmap[str(gr, "id")]
 	}
 	if a, ok := g["assignments"].(map[string]any); ok {
 		for k, v := range a {
@@ -291,7 +397,15 @@ func rebuildScope(srcGroups, srcSections, tgtGroups, tgtSections map[string]any)
 		g["order"] = n
 	}
 
-	s := deepCopy(srcSections).(map[string]any)
+	s := map[string]any{}
+	for k, v := range tgtSections {
+		s[k] = v
+	}
+	for k, v := range srcSections {
+		if _, kept := s[k]; !kept || k == "sections" {
+			s[k] = deepCopy(v)
+		}
+	}
 	for _, sec := range listOf(s, "sections") {
 		if str(sec, "kind") != "manual" {
 			continue
@@ -303,37 +417,40 @@ func rebuildScope(srcGroups, srcSections, tgtGroups, tgtSections map[string]any)
 	return g, s, nil
 }
 
-// writePrefsMirror updates the copy of the folders in the app's preferences.
-func writePrefsMirror(path string, groups, sections map[string]any) error {
+// planPrefsMirror rebuilds the copy of the folders in the app's preferences
+// from its own source entry. It returns the file to write and whether it
+// changed.
+func planPrefsMirror(path, source string, others []string) (*object, bool, error) {
 	cfg, err := readObject(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return err
+		return nil, false, err
+	}
+	raw, ok := cfg.get("preferences")
+	if !ok {
+		return nil, false, nil
 	}
 	var prefs map[string]any
-	if raw, ok := cfg.get("preferences"); ok {
-		if err := decodeJSON(raw, &prefs); err != nil {
-			return err
-		}
-	}
-	if prefs == nil {
-		prefs = map[string]any{}
+	if err := decodeJSON(raw, &prefs); err != nil {
+		return nil, false, err
 	}
 	ep, _ := prefs["epitaxyPrefs"].(map[string]any)
-	if ep == nil {
-		ep = map[string]any{}
-	}
-	ep["dframe-group-scopes"] = groups
-	ep["dframe-code-sections"] = sections
-	prefs["epitaxyPrefs"] = ep
-	raw, err := encodeJSON(prefs)
+	g, _ := ep["dframe-group-scopes"].(map[string]any)
+	s, _ := ep["dframe-code-sections"].(map[string]any)
+	changed, err := syncScopes(g, s, source, others, false)
 	if err != nil {
-		return err
+		return nil, false, fmt.Errorf("preferences mirror: %w", err)
+	}
+	if !changed {
+		return nil, false, nil
+	}
+	if raw, err = encodeJSON(prefs); err != nil {
+		return nil, false, err
 	}
 	cfg.set("preferences", raw)
-	return cfg.write(path)
+	return cfg, true, nil
 }
 
 // pinEdit is an entry file whose pin is to be set to starred.
@@ -343,8 +460,8 @@ type pinEdit struct {
 }
 
 // planPins lists the entry files of the other accounts whose pin differs
-// from the same chat in source. Chats an account does not have are left
-// to the chat import.
+// from the same chat in source. Chats an account does not have, or whose
+// entry there belongs to another conversation, are left alone.
 func planPins(root, source string, others []string) ([]pinEdit, error) {
 	src := filepath.Join(root, filepath.FromSlash(source))
 	files, err := filepath.Glob(filepath.Join(src, "local_*.json"))
@@ -354,36 +471,49 @@ func planPins(root, source string, others []string) ([]pinEdit, error) {
 	sort.Strings(files)
 	var edits []pinEdit
 	for _, f := range files {
-		want, err := starred(f)
+		want, err := readPin(f)
 		if err != nil {
-			continue // An entry the app is rewriting or cannot read is not ours to judge.
+			continue // An entry the app cannot read either is not ours to judge.
 		}
 		for _, scope := range others {
 			dst := filepath.Join(root, filepath.FromSlash(scope), filepath.Base(f))
-			have, err := starred(dst)
-			if err != nil || have == want {
+			have, err := readPin(dst)
+			if err != nil || have.Starred == want.Starred || have.CLISessionID != want.CLISessionID {
 				continue
 			}
-			edits = append(edits, pinEdit{dst, want})
+			edits = append(edits, pinEdit{dst, want.Starred})
 		}
 	}
 	return edits, nil
 }
 
-func starred(path string) (bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false, err
-	}
-	var e struct {
-		IsStarred bool `json:"isStarred"`
-	}
-	err = json.Unmarshal(data, &e)
-	return e.IsStarred, err
+type pinState struct {
+	Starred      bool   `json:"isStarred"`
+	CLISessionID string `json:"cliSessionId"`
 }
 
-// setStarred changes only the isStarred entry of an entry file.
+func readPin(path string) (pinState, error) {
+	var p pinState
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return p, err
+	}
+	err = json.Unmarshal(data, &p)
+	return p, err
+}
+
+func starred(path string) (bool, error) {
+	p, err := readPin(path)
+	return p.Starred, err
+}
+
+// setStarred changes only the isStarred entry of an entry file, and keeps
+// its modification time, which the switcher reads as chat activity.
 func setStarred(path string, on bool) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
 	o, err := readObject(path)
 	if err != nil {
 		return err
@@ -401,7 +531,10 @@ func setStarred(path string, on bool) error {
 		buf.Write(o.vals[k])
 	}
 	buf.WriteByte('}')
-	return writeFileAtomic(path, buf.Bytes())
+	if err := writeFileAtomic(path, buf.Bytes()); err != nil {
+		return err
+	}
+	return os.Chtimes(path, info.ModTime(), info.ModTime())
 }
 
 // Local Storage values are one byte of encoding and the text:
@@ -570,6 +703,9 @@ func copyDir(src, dst string) error {
 // renamed aside first, so a failure leaves cur as it was.
 func swapDir(next, cur string) error {
 	old := cur + ".switcher-old"
+	if _, err := os.Stat(cur); err != nil {
+		return fmt.Errorf("%s is missing: %w", cur, err)
+	}
 	if err := os.RemoveAll(old); err != nil {
 		return err
 	}
@@ -582,7 +718,9 @@ func swapDir(next, cur string) error {
 		}
 		return err
 	}
-	return os.RemoveAll(old)
+	// The old copy is in the backup; a leftover is removed on the next swap.
+	_ = os.RemoveAll(old)
+	return nil
 }
 
 // scopeKey is how the app names an account's sidebar.

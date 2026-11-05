@@ -56,11 +56,20 @@ func fakeApp(t *testing.T) desktop {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The persisted copies hold the same layout, with empty member lists, as
+	// the app keeps them.
+	pg, ps := deepCopy(state["customGroupsByScope"]), deepCopy(state["codeSidebarByScope"]).(map[string]any)
+	for _, sc := range ps {
+		sc.(map[string]any)["migratedFrom"] = "persisted"
+	}
 	must(t, lsPut(db, map[string]any{lsStore: map[string]any{"state": state, "version": json.Number("0")},
-		lsGroups: map[string]any{"value": state["customGroupsByScope"]}}))
+		lsGroups: map[string]any{"value": pg, "tabId": "t1"}, lsSections: map[string]any{"value": ps, "tabId": "t1"}}))
 	must(t, db.write(map[string][]byte{lsPrefix + "unrelated": {1, 'x'}}))
 	must(t, db.close())
-	must(t, os.WriteFile(d.prefsPath(), []byte(`{"preferences":{"other":1,"epitaxyPrefs":{"keep":true}},"x":2}`), 0o600))
+	prefs := map[string]any{"preferences": map[string]any{"other": 1, "epitaxyPrefs": map[string]any{"keep": true,
+		"dframe-group-scopes": state["customGroupsByScope"], "dframe-code-sections": state["codeSidebarByScope"]}}, "x": 2}
+	data, _ := json.Marshal(prefs)
+	must(t, os.WriteFile(d.prefsPath(), data, 0o600))
 	for _, scope := range []string{scopeA, scopeB, scopeC} {
 		dir := filepath.Join(d.sessionsDir(), filepath.FromSlash(scope))
 		must(t, os.MkdirAll(dir, 0o700))
@@ -99,8 +108,8 @@ func readState(t *testing.T, d desktop) map[string]any {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !jsonEqual(g["value"], store["state"].(map[string]any)["customGroupsByScope"]) {
-		t.Error("persisted folders differ from the store")
+	if g["tabId"] != "t1" {
+		t.Errorf("persisted copy lost its other fields: %v", g)
 	}
 	return store["state"].(map[string]any)
 }
@@ -121,8 +130,16 @@ func TestSyncSidebar(t *testing.T) {
 	must(t, err)
 	secCopy, err := lsGet(db, lsSections)
 	db.close()
-	if err != nil || !jsonEqual(secCopy["value"], st["codeSidebarByScope"]) {
-		t.Errorf("sections copy not written: %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each copy is rebuilt from its own source entry and keeps the
+	// target's bookkeeping.
+	if mf := secCopy["value"].(map[string]any)[scopeB].(map[string]any)["migratedFrom"]; mf != "persisted" {
+		t.Errorf("persisted sections of B: migratedFrom %v", mf)
+	}
+	if !jsonEqual(stripMigrated(secCopy["value"]), stripMigrated(st["codeSidebarByScope"])) {
+		t.Error("persisted sections differ from the store")
 	}
 	groups := st["customGroupsByScope"].(map[string]any)
 	// B keeps its own id for Alpha and gets A's id for Beta, which it lacked.
@@ -170,13 +187,11 @@ func TestSyncSidebar(t *testing.T) {
 		t.Errorf("mirror %v", m)
 	}
 	// A backup with the old database, mirror and entries.
-	entries, _ := os.ReadDir(bk)
-	if len(entries) != 1 {
-		t.Fatalf("backups %v", entries)
-	}
 	for _, f := range []string{"leveldb/CURRENT", "claude_desktop_config.json", "claude-code-sessions/bbbb/orgB/local_1.json"} {
-		if _, err := os.Stat(filepath.Join(bk, entries[0].Name(), filepath.FromSlash(f))); err != nil {
-			t.Errorf("backup lacks %s", f)
+		for _, dir := range []string{res.Backup, filepath.Join(bk, "first")} {
+			if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(f))); err != nil {
+				t.Errorf("backup %s lacks %s", dir, f)
+			}
 		}
 	}
 	// A second run finds nothing to do.
@@ -220,5 +235,74 @@ func TestLocalStorageEncoding(t *testing.T) {
 	}
 	if lsEncode("é")[0] != 1 || lsEncode("中")[0] != 0 {
 		t.Error("wrong encoding chosen")
+	}
+}
+
+func stripMigrated(v any) any {
+	c := deepCopy(v).(map[string]any)
+	for _, sc := range c {
+		delete(sc.(map[string]any), "migratedFrom")
+	}
+	return c
+}
+
+func TestSyncSidebarRefusesEmptySource(t *testing.T) {
+	appRunning = func() bool { return false }
+	d := fakeApp(t)
+	before := readState(t, d)
+	if _, err := syncSidebar(d, scopeC, []string{scopeA, scopeB, scopeC}, t.TempDir()); err == nil {
+		t.Fatal("copied an account without folders over the others")
+	}
+	if !jsonEqual(before, readState(t, d)) {
+		t.Error("state changed")
+	}
+}
+
+func TestRebuildScopeRefusesDuplicateNames(t *testing.T) {
+	g, s := layout(map[string]string{"Alpha": "x1"}, nil)
+	g["groups"] = append(g["groups"].([]any), map[string]any{"id": "x2", "name": "Alpha"})
+	tg, ts := layout(map[string]string{"Alpha": "y1"}, nil)
+	if _, _, err := rebuildScope(g, s, tg, ts); err == nil {
+		t.Error("source with two folders of one name accepted")
+	}
+	if _, _, err := rebuildScope(tg, ts, g, s); err == nil {
+		t.Error("target with two folders of one name accepted")
+	}
+}
+
+func TestPinsSkipOtherConversation(t *testing.T) {
+	appRunning = func() bool { return false }
+	d := fakeApp(t)
+	p := filepath.Join(d.sessionsDir(), "bbbb", "orgB", "local_1.json")
+	must(t, os.WriteFile(p, []byte(`{"sessionId":"local_1","cliSessionId":"other","isStarred":false}`), 0o600))
+	if _, err := syncSidebar(d, scopeA, []string{scopeA, scopeB, scopeC}, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if on, _ := starred(p); on {
+		t.Error("pinned an entry of another conversation")
+	}
+}
+
+func TestSyncSidebarRollsBackOnPinFailure(t *testing.T) {
+	appRunning = func() bool { return false }
+	d := fakeApp(t)
+	before := readState(t, d)
+	prefsBefore, _ := os.ReadFile(d.prefsPath())
+	// A pin target that cannot be replaced: its folder is read-only.
+	dir := filepath.Join(d.sessionsDir(), "cccc", "orgC")
+	must(t, os.Chmod(dir, 0o500))
+	defer os.Chmod(dir, 0o700)
+	_, err := syncSidebar(d, scopeA, []string{scopeA, scopeB, scopeC}, t.TempDir())
+	if err == nil {
+		t.Skip("folder permissions not enforced here")
+	}
+	if !jsonEqual(before, readState(t, d)) {
+		t.Error("Local Storage not put back")
+	}
+	if after, _ := os.ReadFile(d.prefsPath()); string(after) != string(prefsBefore) {
+		t.Error("preferences not put back")
+	}
+	if on, _ := starred(filepath.Join(d.sessionsDir(), "bbbb", "orgB", "local_1.json")); on {
+		t.Error("pin of B not put back")
 	}
 }

@@ -115,6 +115,9 @@ type switcher struct {
 	status   string
 	addingAt time.Time
 	onChange func()
+	// notice is shown in the menu after a switch that worked, for a step
+	// that failed without stopping it.
+	notice string
 	// After a 429, an account is not asked again before its backoff ends.
 	backoff map[string]time.Time
 	strikes map[string]int
@@ -365,8 +368,9 @@ func (s *switcher) run(what string, f func() error) {
 	}
 	s.mu.Lock()
 	if s.addingAt.IsZero() {
-		s.status = ""
+		s.status = s.notice
 	}
+	s.notice = ""
 	s.mu.Unlock()
 	s.onChange()
 	s.refresh(context.Background())
@@ -572,6 +576,9 @@ func (s *switcher) syncSidebarFrom(from string) {
 	switch {
 	case err != nil:
 		log.Printf("sidebar not synced from %s: %v", src.label(), err)
+		s.mu.Lock()
+		s.notice = tr("Sidebar not synced: ", "侧边栏未同步：") + err.Error()
+		s.mu.Unlock()
 	case res.Changed:
 		log.Printf("sidebar synced from %s: folders in %d accounts, %d pins, backup %s", src.label(), res.Scopes, res.Pins, res.Backup)
 	default:
