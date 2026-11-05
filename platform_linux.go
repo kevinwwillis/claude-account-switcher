@@ -57,9 +57,27 @@ func desktopProcesses() (pids []uint32, exe string) {
 	return append(pids, helpers...), exe
 }
 
+// desktopRunning also trusts Chromium's profile lock, so a changed install
+// path cannot make the switcher write under a running app.
 func desktopRunning() bool {
 	pids, _ := desktopProcesses()
-	return len(pids) > 0
+	return len(pids) > 0 || profileLocked(claudeDesktop().dir)
+}
+
+// profileLocked reports whether the SingletonLock of the data folder names a
+// process of this host that is alive. The link reads "<host>-<pid>".
+func profileLocked(dir string) bool {
+	target, err := os.Readlink(filepath.Join(dir, "SingletonLock"))
+	if err != nil {
+		return false
+	}
+	i := strings.LastIndex(target, "-")
+	host, _ := os.Hostname()
+	pid, err := strconv.Atoi(target[i+1:])
+	if i < 0 || err != nil || target[:i] != host {
+		return false
+	}
+	return syscall.Kill(pid, 0) == nil
 }
 
 // quitDesktop asks the app to close the way the desktop does on logout,
@@ -117,13 +135,20 @@ func startDesktop(exe string) error {
 // session.
 func runDetached(unit, exe string, args ...string) error {
 	if path, err := exec.LookPath("systemd-run"); err == nil {
+		// KillMode=process: when the app's main process exits, whatever it
+		// left running is not ended with it, as under the dock.
 		cmdArgs := append([]string{"--user", "--collect", "--quiet", "--slice=app.slice", "--unit=" + unit,
-			"-p", "Type=exec", "--", exe}, args...)
+			"-p", "Type=exec", "-p", "KillMode=process", "--", exe}, args...)
 		if out, err := exec.Command(path, cmdArgs...).CombinedOutput(); err == nil {
 			return nil
 		} else {
 			log.Printf("systemd-run %s: %v %s", unit, err, strings.TrimSpace(string(out)))
 		}
+	}
+	// A child inherits no_new_privs, which would break sudo in Claude's
+	// terminals for good. Then it is better not to start at all.
+	if noNewPrivs() {
+		return errors.New("systemd-run failed and this process has no_new_privs set; start Claude from the dock")
 	}
 	cmd := exec.Command(exe, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -132,6 +157,11 @@ func runDetached(unit, exe string, args ...string) error {
 	}
 	go cmd.Wait()
 	return nil
+}
+
+func noNewPrivs() bool {
+	status, err := os.ReadFile("/proc/self/status")
+	return err != nil || strings.Contains(string(status), "NoNewPrivs:\t1")
 }
 
 // shellOpen opens a folder, or a web page in the default browser.

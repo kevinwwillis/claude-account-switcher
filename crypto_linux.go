@@ -25,20 +25,27 @@ const (
 )
 
 var (
-	keyOnce sync.Once
-	keyVal  []byte
-	keyErr  error
+	keyMu  sync.Mutex
+	keyVal []byte
 )
 
+// appKey reads the key once it can. A failure, such as a keyring still
+// locked after login, is tried again on the next call.
 func appKey() ([]byte, error) {
-	keyOnce.Do(func() {
-		var pw []byte
-		pw, keyErr = keyringPassword()
-		if keyErr == nil {
-			keyVal, keyErr = linuxKey(pw)
-		}
-	})
-	return keyVal, keyErr
+	keyMu.Lock()
+	defer keyMu.Unlock()
+	if keyVal != nil {
+		return keyVal, nil
+	}
+	pw, err := keyringPassword()
+	if err != nil {
+		return nil, err
+	}
+	key, err := linuxKey(pw)
+	if err == nil {
+		keyVal = key
+	}
+	return key, err
 }
 
 func linuxKey(password []byte) ([]byte, error) {
