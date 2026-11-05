@@ -39,11 +39,8 @@ func desktopProcesses() (pids []uint32, exe string) {
 			continue
 		}
 		dir := filepath.Join("/proc", e.Name())
-		path, err := os.Readlink(filepath.Join(dir, "exe"))
-		if err != nil || filepath.Base(path) != desktopName {
-			continue
-		}
-		if _, err := os.Stat(filepath.Join(filepath.Dir(path), "resources", "app.asar")); err != nil {
+		path, ok := desktopExe(uint32(pid))
+		if !ok {
 			continue
 		}
 		cmdline, _ := os.ReadFile(filepath.Join(dir, "cmdline"))
@@ -59,6 +56,18 @@ func desktopProcesses() (pids []uint32, exe string) {
 
 // desktopRunning also trusts Chromium's profile lock, so a changed install
 // path cannot make the switcher write under a running app.
+// desktopExe returns the executable of pid when it is the app. An app whose
+// package was upgraded while it ran shows its old file as "(deleted)"; it
+// still counts.
+func desktopExe(pid uint32) (string, bool) {
+	path, err := os.Readlink(filepath.Join("/proc", strconv.FormatUint(uint64(pid), 10), "exe"))
+	if err != nil {
+		return "", false
+	}
+	path = strings.TrimSuffix(path, " (deleted)")
+	return path, filepath.Base(path) == desktopName
+}
+
 func desktopRunning() bool {
 	pids, _ := desktopProcesses()
 	return len(pids) > 0 || profileLocked(claudeDesktop().dir)
@@ -77,7 +86,9 @@ func profileLocked(dir string) bool {
 	if i < 0 || err != nil || target[:i] != host {
 		return false
 	}
-	return syscall.Kill(pid, 0) == nil
+	// After a reboot the pid may belong to something else.
+	_, isApp := desktopExe(uint32(pid))
+	return isApp
 }
 
 // quitDesktop asks the app to close the way the desktop does on logout,
@@ -85,6 +96,9 @@ func profileLocked(dir string) bool {
 func quitDesktop() error {
 	pids, _ := desktopProcesses()
 	if len(pids) == 0 {
+		if desktopRunning() {
+			return errors.New(tr("Claude seems to be running but its process was not found; quit Claude by hand", "Claude 似乎在运行但找不到其进程，请手动退出 Claude"))
+		}
 		return nil
 	}
 	began := time.Now()
@@ -183,7 +197,7 @@ func askToQuitOld() {}
 func insideDesktop() bool {
 	for pid := os.Getppid(); pid > 1; {
 		dir := filepath.Join("/proc", strconv.Itoa(pid))
-		if path, err := os.Readlink(filepath.Join(dir, "exe")); err == nil && filepath.Base(path) == desktopName {
+		if _, ok := desktopExe(uint32(pid)); ok {
 			return true
 		}
 		status, err := os.ReadFile(filepath.Join(dir, "status"))
