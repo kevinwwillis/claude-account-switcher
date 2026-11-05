@@ -60,6 +60,9 @@ func (t *tray) onReady() {
 	t.sidebar = systray.AddMenuItemCheckbox(tr("Same sidebar in every account", "所有账号使用相同侧边栏"),
 		tr("On every switch, give all accounts the folders, folder contents and pins of the account you leave",
 			"每次切换时，让所有账号使用所离开账号的文件夹、文件夹内容和置顶"), false)
+	if runtime.GOOS != "linux" {
+		t.sidebar.Hide() // The sync needs LevelDB, only the Linux build has it.
+	}
 	t.add = systray.AddMenuItem(tr("Add account…", "添加账号…"),
 		tr("Restart Claude on its sign-in screen, your current account is kept", "重启 Claude 并打开登录页面，当前账号会保留"))
 	t.importNow = systray.AddMenuItem(tr("Import chats from all accounts", "导入所有账号的聊天"),

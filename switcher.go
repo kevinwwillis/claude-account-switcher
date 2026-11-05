@@ -360,6 +360,9 @@ func (s *switcher) run(what string, f func() error) {
 	if !s.busy.CompareAndSwap(false, true) {
 		return
 	}
+	s.mu.Lock()
+	s.notice = ""
+	s.mu.Unlock()
 	err := f()
 	s.busy.Store(false)
 	if err != nil {
@@ -478,7 +481,9 @@ func (s *switcher) switchTo(uuid string, cause switchCause) error {
 		n, err := syncSessions(s.app().sessionsDir(), target.UUID, target.Org)
 		log.Printf("switched to %s, %d chats imported", target.label(), n)
 		s.importProjects(target)
-		s.syncSidebarFrom(active)
+		if err == nil {
+			s.syncSidebarFrom(active)
+		}
 		return err
 	})
 	if err == nil {
@@ -569,7 +574,13 @@ func (s *switcher) syncSidebarFrom(from string) {
 		}
 	}
 	s.mu.Unlock()
-	if !on || src == nil || src.Org == "" {
+	if !on {
+		return
+	}
+	if src == nil || src.Org == "" {
+		s.mu.Lock()
+		s.notice = tr("Sidebar not synced: the account being left is not known yet", "侧边栏未同步：尚不知道所离开的账号")
+		s.mu.Unlock()
 		return
 	}
 	res, err := syncSidebar(s.app(), scopeKey(src.UUID, src.Org), scopes, filepath.Join(s.dir, "sidebar-backups"))

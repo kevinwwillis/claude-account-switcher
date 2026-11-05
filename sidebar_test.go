@@ -270,7 +270,7 @@ func TestRebuildScopeRefusesDuplicateNames(t *testing.T) {
 	}
 }
 
-func TestPinsSkipOtherConversation(t *testing.T) {
+func TestPinsFollowLocalID(t *testing.T) {
 	appRunning = func() bool { return false }
 	d := fakeApp(t)
 	p := filepath.Join(d.sessionsDir(), "bbbb", "orgB", "local_1.json")
@@ -278,8 +278,8 @@ func TestPinsSkipOtherConversation(t *testing.T) {
 	if _, err := syncSidebar(d, scopeA, []string{scopeA, scopeB, scopeC}, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	if on, _ := starred(p); on {
-		t.Error("pinned an entry of another conversation")
+	if on, _ := starred(p); !on {
+		t.Error("the same sidebar row in B was not pinned")
 	}
 }
 
@@ -304,5 +304,29 @@ func TestSyncSidebarRollsBackOnPinFailure(t *testing.T) {
 	}
 	if on, _ := starred(filepath.Join(d.sessionsDir(), "bbbb", "orgB", "local_1.json")); on {
 		t.Error("pin of B not put back")
+	}
+}
+
+func TestPinsSyncEvenWhenFoldersCannot(t *testing.T) {
+	appRunning = func() bool { return false }
+	d := fakeApp(t)
+	// C has two folders of one name, so folders cannot be matched.
+	db, err := openLocalStorage(d.localStorageDir(), false)
+	must(t, err)
+	store, err := lsGet(db, lsStore)
+	must(t, err)
+	c := store["state"].(map[string]any)["customGroupsByScope"].(map[string]any)[scopeC].(map[string]any)
+	c["groups"] = []any{map[string]any{"id": "d1", "name": "Dup"}, map[string]any{"id": "d2", "name": "Dup"}}
+	must(t, lsPut(db, map[string]any{lsStore: store}))
+	must(t, db.close())
+	res, err := syncSidebar(d, scopeA, []string{scopeA, scopeB, scopeC}, t.TempDir())
+	if err == nil {
+		t.Error("no error for duplicate folder names")
+	}
+	if res.Pins != 2 {
+		t.Errorf("pins not synced: %+v", res)
+	}
+	if on, _ := starred(filepath.Join(d.sessionsDir(), "cccc", "orgC", "local_1.json")); !on {
+		t.Error("C not pinned")
 	}
 }

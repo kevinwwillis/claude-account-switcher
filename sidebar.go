@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -69,7 +70,8 @@ type sidebarResult struct {
 // it copies everything it changes into a new folder under backupRoot (the
 // first backup ever made is kept for good in backupRoot/first). If a step
 // fails, what it had written is put back.
-func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (res sidebarResult, err error) {
+func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (sidebarResult, error) {
+	var res sidebarResult
 	if appRunning() {
 		return res, errors.New("Claude is running")
 	}
@@ -100,13 +102,16 @@ func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (
 		return res, fmt.Errorf("copy Local Storage: %w", err)
 	}
 	defer os.RemoveAll(work)
-	changed, err := rewriteLocalStorage(work, source, others)
-	if err != nil {
-		return res, err
+	// A folder problem does not hold back the pins; it is reported at the end.
+	changed, folderErr := rewriteLocalStorage(work, source, others)
+	var mirror *object
+	mirrorChanged := false
+	if folderErr == nil {
+		mirror, mirrorChanged, folderErr = planPrefsMirror(d.prefsPath(), source, others)
 	}
-	mirror, mirrorChanged, err := planPrefsMirror(d.prefsPath(), source, others)
-	if err != nil {
-		return res, err
+	if folderErr != nil {
+		changed, mirrorChanged = false, false
+		folderErr = fmt.Errorf("folders not synced: %w", folderErr)
 	}
 
 	// The pins.
@@ -116,7 +121,7 @@ func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (
 		return res, err
 	}
 	if !changed && !mirrorChanged && len(pinEdits) == 0 {
-		return res, nil
+		return res, folderErr
 	}
 
 	// Back up everything that is about to change.
@@ -140,26 +145,22 @@ func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (
 	keepFirstBackup(backupRoot, bk)
 	pruneBackups(backupRoot)
 
-	// Write: the database, the mirror, the pins. Any failure puts all of it back.
+	// Write: the database, the mirror, the pins. A failure puts all of it back.
 	var pinsDone []pinEdit
-	defer func() {
-		if err != nil {
-			if rerr := restoreSidebar(d, bk, pinsDone); rerr != nil {
-				err = fmt.Errorf("%w; putting the backup %s back also failed: %v", err, bk, rerr)
-			} else {
-				err = fmt.Errorf("%w (the backup was put back)", err)
-			}
-			res = sidebarResult{Backup: bk}
+	fail := func(werr error) (sidebarResult, error) {
+		if rerr := restoreSidebar(d, bk, pinsDone); rerr != nil {
+			return sidebarResult{Backup: bk}, fmt.Errorf("%w; putting the backup %s back also failed: %v", werr, bk, rerr)
 		}
-	}()
+		return sidebarResult{Backup: bk}, fmt.Errorf("%w (the backup was put back)", werr)
+	}
 	if changed {
-		if err = swapDir(work, live); err != nil {
-			return res, fmt.Errorf("replace Local Storage: %w", err)
+		if err := swapDir(work, live); err != nil {
+			return fail(fmt.Errorf("replace Local Storage: %w", err))
 		}
 	}
 	if mirrorChanged {
-		if err = mirror.write(d.prefsPath()); err != nil {
-			return res, fmt.Errorf("update %s: %w", filepath.Base(d.prefsPath()), err)
+		if err := mirror.write(d.prefsPath()); err != nil {
+			return fail(fmt.Errorf("update %s: %w", filepath.Base(d.prefsPath()), err))
 		}
 	}
 	if changed || mirrorChanged {
@@ -167,13 +168,13 @@ func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (
 	}
 	for _, e := range pinEdits {
 		pinsDone = append(pinsDone, e)
-		if err = setStarred(e.path, e.starred); err != nil {
-			return res, fmt.Errorf("set pin: %w", err)
+		if err := setStarred(e.path, e.starred); err != nil {
+			return fail(fmt.Errorf("set pin: %w", err))
 		}
 	}
 	res.Pins = len(pinEdits)
 	res.Changed = true
-	return res, nil
+	return res, folderErr
 }
 
 // newSidebarBackup makes a new, empty backup folder.
@@ -191,13 +192,21 @@ func keepFirstBackup(root, bk string) {
 	if _, err := os.Stat(first); err == nil {
 		return
 	}
-	_ = filepath.WalkDir(bk, func(p string, e os.DirEntry, err error) error {
+	tmp := first + ".partial"
+	_ = os.RemoveAll(tmp)
+	err := filepath.WalkDir(bk, func(p string, e os.DirEntry, err error) error {
 		if err != nil || e.IsDir() {
 			return err
 		}
 		rel, _ := filepath.Rel(bk, p)
-		return copyFile(p, filepath.Join(first, rel))
+		return copyFile(p, filepath.Join(tmp, rel))
 	})
+	if err == nil {
+		err = os.Rename(tmp, first)
+	}
+	if err != nil {
+		_ = os.RemoveAll(tmp)
+	}
 }
 
 // restoreSidebar puts a sidebar backup back: the database, the mirror and
@@ -313,6 +322,15 @@ func syncScopes(groups, sections map[string]any, source string, others []string,
 		}
 		if !jsonEqual(g, groups[scope]) || !jsonEqual(s, sections[scope]) {
 			changed = true
+		}
+		kept := map[string]bool{}
+		for _, gr := range listOf(g, "groups") {
+			kept[str(gr, "name")] = true
+		}
+		for _, gr := range listOf(tgtGroups, "groups") {
+			if !kept[str(gr, "name")] {
+				log.Printf("sidebar sync: folder %q of %s is not in the account being left and is removed (it is in the backup)", str(gr, "name"), scope)
+			}
 		}
 		groups[scope], sections[scope] = g, s
 	}
@@ -460,8 +478,8 @@ type pinEdit struct {
 }
 
 // planPins lists the entry files of the other accounts whose pin differs
-// from the same chat in source. Chats an account does not have, or whose
-// entry there belongs to another conversation, are left alone.
+// from the same chat in source. A chat is its sidebar row, the local id,
+// as for the folders; chats an account does not have are left alone.
 func planPins(root, source string, others []string) ([]pinEdit, error) {
 	src := filepath.Join(root, filepath.FromSlash(source))
 	files, err := filepath.Glob(filepath.Join(src, "local_*.json"))
@@ -478,7 +496,7 @@ func planPins(root, source string, others []string) ([]pinEdit, error) {
 		for _, scope := range others {
 			dst := filepath.Join(root, filepath.FromSlash(scope), filepath.Base(f))
 			have, err := readPin(dst)
-			if err != nil || have.Starred == want.Starred || have.CLISessionID != want.CLISessionID {
+			if err != nil || have.Starred == want.Starred {
 				continue
 			}
 			edits = append(edits, pinEdit{dst, want.Starred})
