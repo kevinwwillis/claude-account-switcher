@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -39,12 +40,18 @@ func nativeResume(titles []string, wait time.Duration) []bool {
 		"--ok-label=" + tr("Continue", "继续"), "--cancel-label=" + tr("Don't continue", "不继续"),
 		"--timeout=" + strconv.Itoa(max(1, int(wait/time.Second))),
 		"--column=", "--column=#", "--column=" + tr("Chat", "聊天"), "--hide-column=2", "--print-column=2", "--separator=\n"}
+	// The rows go on stdin, one value per line, so a title cannot be read
+	// as an option.
+	var rows strings.Builder
 	for i, t := range titles {
-		args = append(args, "TRUE", strconv.Itoa(i+1), t)
+		t = strings.ReplaceAll(strings.ReplaceAll(t, "\r", " "), "\n", " ")
+		fmt.Fprintf(&rows, "TRUE\n%d\n%s\n", i+1, t)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), wait+5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "zenity", args...).Output()
+	cmd := exec.CommandContext(ctx, "zenity", args...)
+	cmd.Stdin = strings.NewReader(rows.String())
+	out, err := cmd.Output()
 	var exit *exec.ExitError
 	switch {
 	case ctx.Err() != nil:
