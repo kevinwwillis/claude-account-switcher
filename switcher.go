@@ -117,7 +117,7 @@ type switcher struct {
 	// addingFrom is the account that was signed in when Add account began.
 	// The import after the new sign-in gives the new account its sidebar.
 	addingFrom string
-	onChange func()
+	onChange   func()
 	// notice is shown in the menu after a switch that worked, for a step
 	// that failed without stopping it.
 	notice string
