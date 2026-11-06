@@ -297,6 +297,12 @@ func installLauncher() error {
 		return err
 	}
 	icon := filepath.Join(dataHome(), "icons", "hicolor", "scalable", "apps", "claude-account-switcher.svg")
+	// The icon is written before the entry, and the entry names its file,
+	// so the desktop never reads an entry whose icon is missing and falls
+	// back to its generic one.
+	if err := writeIfChanged(icon, markSVG); err != nil {
+		return err
+	}
 	entry := fmt.Sprintf(`[Desktop Entry]
 Type=Application
 Name=Claude Account Switcher
@@ -304,25 +310,24 @@ GenericName=Account switcher for Claude
 Comment=Switch the Claude desktop app between accounts and show plan usage
 Keywords=Claude;account;switcher;usage;Anthropic;
 Exec=%s
-Icon=claude-account-switcher
+Icon=%s
 Categories=Utility;
 StartupNotify=false
-`, desktopExecQuote(exe))
-	for path, data := range map[string][]byte{
-		icon: markSVG,
-		filepath.Join(dataHome(), "applications", "claude-account-switcher.desktop"): []byte(entry),
-	} {
-		if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, data) {
-			continue
-		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(path, data, 0o644); err != nil {
-			return err
-		}
+`, desktopExecQuote(exe), icon)
+	if err := writeIfChanged(filepath.Join(dataHome(), "applications", "claude-account-switcher.desktop"), []byte(entry)); err != nil {
+		return err
 	}
 	return nil
+}
+
+func writeIfChanged(path string, data []byte) error {
+	if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, data) {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
 }
 
 // systemLanguages lists the user's languages, preferred first, from the
