@@ -70,6 +70,9 @@ func (t *tray) onReady() {
 	systray.AddSeparator()
 	// Rewriting an enabled entry keeps its path current and adds the Task
 	// Manager record that entries from before v0.1.2 are missing.
+	if err := installLauncher(); err != nil {
+		log.Printf("app list entry: %v", err)
+	}
 	if autostartEnabled() {
 		if err := setAutostart(true); err != nil {
 			log.Printf("refresh start at login: %v", err)

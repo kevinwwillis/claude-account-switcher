@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	_ "embed"
 	"errors"
 	"fmt"
 	"log"
@@ -259,7 +261,7 @@ func setAutostart(on bool) error {
 	if err != nil {
 		return err
 	}
-	entry := fmt.Sprintf("[Desktop Entry]\nType=Application\nName=Claude Account Switcher\nExec=%s\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n", desktopExecQuote(exe))
+	entry := fmt.Sprintf("[Desktop Entry]\nType=Application\nName=Claude Account Switcher\nExec=%s\nIcon=claude-account-switcher\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n", desktopExecQuote(exe))
 	if err := os.MkdirAll(filepath.Dir(autostartPath()), 0o755); err != nil {
 		return err
 	}
@@ -273,6 +275,54 @@ func desktopExecQuote(s string) string {
 	}
 	r := strings.NewReplacer(`\`, `\\\\`, `"`, `\\"`, "`", "\\\\`", `$`, `\\$`, `%`, `%%`)
 	return `"` + r.Replace(s) + `"`
+}
+
+//go:embed assets/mark.svg
+var markSVG []byte
+
+func dataHome() string {
+	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
+		return d
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "share")
+}
+
+// installLauncher puts the switcher in the desktop's app list, so it can be
+// found by name and started from there, and keeps the entry pointing at the
+// running file. Starting it while it runs does nothing.
+func installLauncher() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	icon := filepath.Join(dataHome(), "icons", "hicolor", "scalable", "apps", "claude-account-switcher.svg")
+	entry := fmt.Sprintf(`[Desktop Entry]
+Type=Application
+Name=Claude Account Switcher
+GenericName=Account switcher for Claude
+Comment=Switch the Claude desktop app between accounts and show plan usage
+Keywords=Claude;account;switcher;usage;Anthropic;
+Exec=%s
+Icon=claude-account-switcher
+Categories=Utility;
+StartupNotify=false
+`, desktopExecQuote(exe))
+	for path, data := range map[string][]byte{
+		icon: markSVG,
+		filepath.Join(dataHome(), "applications", "claude-account-switcher.desktop"): []byte(entry),
+	} {
+		if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, data) {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // systemLanguages lists the user's languages, preferred first, from the
