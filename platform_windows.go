@@ -356,3 +356,6 @@ func systemLanguages() []string {
 	}
 	return langs
 }
+
+// installLauncher adds the switcher to the app list where the platform needs it.
+func installLauncher() error { return nil }

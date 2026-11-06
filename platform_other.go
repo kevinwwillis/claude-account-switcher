@@ -46,3 +46,6 @@ func nativeAskNumber(string, string, string) (string, bool) { return "", false }
 func showWebDialog(dialogWindow, string) (json.RawMessage, error) { return nil, errUnsupported }
 
 func systemLanguages() []string { return []string{os.Getenv("LANG")} }
+
+// installLauncher adds the switcher to the app list where the platform needs it.
+func installLauncher() error { return nil }
