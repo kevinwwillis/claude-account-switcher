@@ -27,7 +27,8 @@ import (
 // preferences.epitaxyPrefs, but the app treats Local Storage as the truth.
 // Each account gets its own folder ids, so folders are matched by name.
 //
-// Pins are the isStarred flag of each chat's entry file, per account. Pin
+// Pins and archiving are the isStarred and isArchived flags of each chat's
+// entry file, per account. Pin
 // order, grouping, sorting and collapsed groups are stored once for all
 // accounts and need no copying.
 
@@ -60,7 +61,7 @@ func (d desktop) prefsPath() string { return filepath.Join(d.dir, "claude_deskto
 // sidebarResult says what a sidebar sync changed.
 type sidebarResult struct {
 	Scopes  int    // other accounts whose folders were rewritten
-	Pins    int    // entry files whose pin was changed
+	Pins    int    // entry files whose pin or archived flag was changed
 	Backup  string // where the old files are
 	Changed bool
 }
@@ -168,7 +169,7 @@ func syncSidebar(d desktop, source string, scopes []string, backupRoot string) (
 	}
 	for _, e := range pinEdits {
 		pinsDone = append(pinsDone, e)
-		if err := setStarred(e.path, e.starred); err != nil {
+		if err := setFlags(e.path, e.starred, e.archived); err != nil {
 			return fail(fmt.Errorf("set pin: %w", err))
 		}
 	}
@@ -471,14 +472,14 @@ func planPrefsMirror(path, source string, others []string) (*object, bool, error
 	return cfg, true, nil
 }
 
-// pinEdit is an entry file whose pin is to be set to starred.
+// pinEdit is an entry file whose pin and archived flag are to be set.
 type pinEdit struct {
-	path    string
-	starred bool
+	path              string
+	starred, archived bool
 }
 
-// planPins lists the entry files of the other accounts whose pin differs
-// from the same chat in source. A chat is its sidebar row, the local id,
+// planPins lists the entry files of the other accounts whose pin or
+// archived flag differs from the same chat in source. A chat is its sidebar row, the local id,
 // as for the folders; chats an account does not have are left alone.
 func planPins(root, source string, others []string) ([]pinEdit, error) {
 	src := filepath.Join(root, filepath.FromSlash(source))
@@ -496,10 +497,10 @@ func planPins(root, source string, others []string) ([]pinEdit, error) {
 		for _, scope := range others {
 			dst := filepath.Join(root, filepath.FromSlash(scope), filepath.Base(f))
 			have, err := readPin(dst)
-			if err != nil || have.Starred == want.Starred {
+			if err != nil || (have.Starred == want.Starred && have.Archived == want.Archived) {
 				continue
 			}
-			edits = append(edits, pinEdit{dst, want.Starred})
+			edits = append(edits, pinEdit{dst, want.Starred, want.Archived})
 		}
 	}
 	return edits, nil
@@ -507,6 +508,7 @@ func planPins(root, source string, others []string) ([]pinEdit, error) {
 
 type pinState struct {
 	Starred      bool   `json:"isStarred"`
+	Archived     bool   `json:"isArchived"`
 	CLISessionID string `json:"cliSessionId"`
 }
 
@@ -525,9 +527,10 @@ func starred(path string) (bool, error) {
 	return p.Starred, err
 }
 
-// setStarred changes only the isStarred entry of an entry file, and keeps
-// its modification time, which the switcher reads as chat activity.
-func setStarred(path string, on bool) error {
+// setFlags changes only the isStarred and isArchived entries of an entry
+// file, and keeps its modification time, which the switcher reads as chat
+// activity.
+func setFlags(path string, starred, archived bool) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -536,7 +539,10 @@ func setStarred(path string, on bool) error {
 	if err != nil {
 		return err
 	}
-	o.set("isStarred", json.RawMessage(fmt.Sprint(on)))
+	o.set("isStarred", json.RawMessage(fmt.Sprint(starred)))
+	if _, had := o.get("isArchived"); had || archived {
+		o.set("isArchived", json.RawMessage(fmt.Sprint(archived)))
+	}
 	var buf bytes.Buffer
 	buf.WriteByte('{')
 	for i, k := range o.keys {

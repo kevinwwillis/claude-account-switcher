@@ -114,6 +114,9 @@ type switcher struct {
 	busy     atomic.Bool
 	status   string
 	addingAt time.Time
+	// addingFrom is the account that was signed in when Add account began.
+	// The import after the new sign-in gives the new account its sidebar.
+	addingFrom string
 	onChange func()
 	// notice is shown in the menu after a switch that worked, for a step
 	// that failed without stopping it.
@@ -514,6 +517,9 @@ func (s *switcher) addAccount() error {
 		if err := s.saveActive(active); err != nil {
 			return err
 		}
+		s.mu.Lock()
+		s.addingFrom = active
+		s.mu.Unlock()
 		return clearSignIn(s.app())
 	})
 	if err == nil {
@@ -537,6 +543,13 @@ func (s *switcher) importChats() error {
 		n, err := syncSessions(s.app().sessionsDir(), a.UUID, a.Org)
 		log.Printf("%d chats imported into %s", n, a.label())
 		s.importProjects(a)
+		s.mu.Lock()
+		from := s.addingFrom
+		s.addingFrom = ""
+		s.mu.Unlock()
+		if err == nil && from != "" && from != a.UUID {
+			s.syncSidebarFrom(from)
+		}
 		return err
 	})
 }
@@ -591,7 +604,7 @@ func (s *switcher) syncSidebarFrom(from string) {
 		s.notice = tr("Sidebar not synced: ", "侧边栏未同步：") + err.Error()
 		s.mu.Unlock()
 	case res.Changed:
-		log.Printf("sidebar synced from %s: folders in %d accounts, %d pins, backup %s", src.label(), res.Scopes, res.Pins, res.Backup)
+		log.Printf("sidebar synced from %s: folders in %d accounts, %d chats pinned/archived, backup %s", src.label(), res.Scopes, res.Pins, res.Backup)
 	default:
 		log.Printf("sidebar already matches %s", src.label())
 	}

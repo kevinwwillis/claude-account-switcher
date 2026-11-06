@@ -330,3 +330,24 @@ func TestPinsSyncEvenWhenFoldersCannot(t *testing.T) {
 		t.Error("C not pinned")
 	}
 }
+
+func TestArchivedFollowsSource(t *testing.T) {
+	appRunning = func() bool { return false }
+	d := fakeApp(t)
+	a := filepath.Join(d.sessionsDir(), "aaaa", "orgA", "local_2.json")
+	must(t, os.WriteFile(a, []byte(`{"sessionId":"local_2","title":"t","isStarred":false,"isArchived":true,"lastActivityAt":5}`), 0o600))
+	b := filepath.Join(d.sessionsDir(), "bbbb", "orgB", "local_1.json")
+	must(t, os.WriteFile(b, []byte(`{"sessionId":"local_1","title":"t","isStarred":true,"isArchived":true}`), 0o600))
+	if _, err := syncSidebar(d, scopeA, []string{scopeA, scopeB, scopeC}, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range []string{"bbbb/orgB", "cccc/orgC"} {
+		p, err := readPin(filepath.Join(d.sessionsDir(), filepath.FromSlash(scope), "local_2.json"))
+		if err != nil || !p.Archived {
+			t.Errorf("%s local_2 not archived: %+v %v", scope, p, err)
+		}
+	}
+	if p, _ := readPin(b); p.Archived || !p.Starred {
+		t.Errorf("B local_1 should be unarchived and pinned like A: %+v", p)
+	}
+}
